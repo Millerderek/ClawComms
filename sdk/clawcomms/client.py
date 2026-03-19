@@ -28,6 +28,7 @@ from .identity   import IdentityManager
 from .enrollment import EnrollmentClient
 from .policy     import PolicyGate, DEFAULT_DEV_RULES
 from .messaging  import MessageHandler
+from .anomaly    import AnomalyMonitor, AnomalyConfig
 from .exceptions import ClawCommsError, EnrollmentError, PolicyBlockedError
 
 logger = logging.getLogger("clawcomms.client")
@@ -61,6 +62,7 @@ class ClawCommsClient:
         )
         self._policy     = PolicyGate(workspace_classification=classification)
         self._messaging  = MessageHandler(self._identity, bot_id)
+        self._anomaly    = AnomalyMonitor()
 
         if use_default_policy_rules:
             self._policy.load_rules(DEFAULT_DEV_RULES)
@@ -137,6 +139,9 @@ class ClawCommsClient:
         # Policy Gate — may raise PolicyBlockedError
         envelope = await self._policy.check(envelope)
 
+        # Anomaly detection on outbound (§7.x) — non-blocking
+        await self._anomaly.check_outbound(envelope, sender_credential=credential)
+
         # Determine NATS subject — publish to recipient's .inbox sub-subject
         # so it matches the recipient's `relay.{ws}.{bot_id}.>` subscription
         _to = to if isinstance(to, str) else to[0]
@@ -170,6 +175,24 @@ class ClawCommsClient:
                             logger.warning("Dropping message with invalid signature: %s",
                                            envelope.get("message_id"))
                             return
+
+                # Inbound policy check: injection scan + classification floor (§2.4, §3.3)
+                try:
+                    self._policy.check_inbound(
+                        envelope,
+                        receiver_credential=self._enrollment.credential,
+                    )
+                except PolicyBlockedError as e:
+                    logger.warning("Inbound message blocked by policy: %s (from=%s msg_id=%s)",
+                                   e.reason, envelope.get("from_bot", "?"),
+                                   envelope.get("message_id", "?"))
+                    return
+
+                # Anomaly detection (§7.x) — non-blocking, alert-only
+                await self._anomaly.check_inbound(
+                    envelope,
+                    receiver_credential=self._enrollment.credential,
+                )
 
                 await handler(envelope)
             except Exception as e:

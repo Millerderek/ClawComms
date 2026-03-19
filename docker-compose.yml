@@ -18,9 +18,15 @@ networks:
     driver: bridge
     # Redis is isolated by never publishing its port — no host port binding on redis service
     # internal: true would block enrollment service port binding (docker-proxy limitation)
+    ipam:
+      config:
+        - subnet: 10.200.0.0/24    # Avoid 192.168.x.x — conflicts with home LAN via Tailscale
   relay_net:
     driver: bridge
     internal: false          # NATS clients (bots) need to connect
+    ipam:
+      config:
+        - subnet: 10.200.1.0/24    # Avoid 192.168.x.x — conflicts with home LAN via Tailscale
 
 services:
 
