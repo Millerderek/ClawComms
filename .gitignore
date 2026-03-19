@@ -1,0 +1,18 @@
+# Secrets — never commit
+.env
+keys/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+
+# Test artifacts
+nats/*.creds
+nats_connect_test.py
+verify_nats.py
+
+# Caddy (not used)
+caddy/

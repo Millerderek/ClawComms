@@ -1,0 +1,116 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ClawComms — Segmented Docker Stack
+#
+# Networks:
+#   enroll_net  — Enrollment Service ↔ Redis only (internal, no external routing)
+#   relay_net   — NATS ↔ SDK/bot clients
+#
+# TLS is handled by toolkit-nginx (existing VPS reverse proxy).
+# Enrollment Service binds to host port 8001, nginx proxies dev.clawcomms.com → it.
+#
+# Bootstrap CLI is NOT a service. Run it as:
+#   docker compose run --rm --profile tools bootstrap-cli <command>
+# It has no network — offline key ops only.
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  enroll_net:
+    driver: bridge
+    # Redis is isolated by never publishing its port — no host port binding on redis service
+    # internal: true would block enrollment service port binding (docker-proxy limitation)
+  relay_net:
+    driver: bridge
+    internal: false          # NATS clients (bots) need to connect
+
+services:
+
+  # ── Enrollment Service ─────────────────────────────────────────────────────
+  enrollment-service:
+    build:
+      context: ./enrollment-service
+      dockerfile: Dockerfile
+    container_name: clawcomms-enrollment
+    restart: unless-stopped
+    ports:
+      - "8001:8000"             # toolkit-nginx proxies via 172.17.0.1:8001
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - IEK_CERT_PATH=/keys/iek/iek_cert.json
+      - IEK_PRIVATE_KEY_PATH=/keys/iek/iek_private.enc.json
+      - GENESIS_RECORD_PATH=/keys/genesis/genesis_record.json
+      - RELAY_IEK_PASSPHRASE=${RELAY_IEK_PASSPHRASE}
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - BC_TTL_SECONDS=${BC_TTL_SECONDS:-900}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./keys/iek:/keys/iek:ro                                          # IEK cert + private key
+      - ./keys/genesis:/keys/genesis:ro                                  # Genesis Record
+      - ./keys/wrk/wrk_public.json:/keys/wrk/wrk_public.json:ro
+      - ./keys/nats/account_seed.enc.json:/keys/nats/account_seed.enc.json:ro
+    networks:
+      - enroll_net      # Can reach Redis
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: clawcomms-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --bind 0.0.0.0
+      --save ""
+      --appendonly yes
+      --appendfsync everysec
+      --rename-command FLUSHALL ""
+      --rename-command FLUSHDB  ""
+      --rename-command DEBUG    ""
+      --rename-command CONFIG   "REDIS_CONFIG_CLAWCOMMS"
+    volumes:
+      - redis_data:/data
+    networks:
+      - enroll_net      # Enrollment Service only — not on any other network
+    expose:
+      - "6379"          # Internal only, never published to host
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── NATS Message Bus ───────────────────────────────────────────────────────
+  nats:
+    image: nats:2.10-alpine
+    container_name: clawcomms-nats
+    restart: unless-stopped
+    command: ["-c", "/etc/nats/nats.conf"]
+    ports:
+      - "4222:4222"              # Bot/SDK connections (TLS enforced in nats.conf)
+      - "127.0.0.1:8222:8222"   # NATS monitoring — localhost only
+    volumes:
+      - ./nats/nats.conf:/etc/nats/nats.conf:ro
+      - ./nats/jwt-accounts:/etc/nats/jwt-accounts:ro  # Pre-loaded account JWTs
+      - ./nats/certs:/etc/nats/certs:ro                # TLS certs (future)
+    networks:
+      - relay_net       # Bot/SDK network only — no enrollment or Redis access
+
+  # ── Bootstrap CLI ──────────────────────────────────────────────────────────
+  # Not a running service. Use: docker compose run --rm bootstrap-cli <cmd>
+  # Network disabled — this tool handles WRK private key material.
+  bootstrap-cli:
+    build:
+      context: ./bootstrap-cli
+      dockerfile: Dockerfile
+    container_name: clawcomms-bootstrap
+    network_mode: none     # No network — offline key operations only
+    volumes:
+      - ./keys:/keys       # Full keys dir — WRK, IEK, genesis artifacts land here
+    profiles:
+      - tools              # Only starts when explicitly requested (not `docker compose up`)
+    environment:
+      - RELAY_WRK_PASSPHRASE=${RELAY_WRK_PASSPHRASE}
+
+volumes:
+  redis_data:
