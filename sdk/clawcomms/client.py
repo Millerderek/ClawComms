@@ -137,8 +137,10 @@ class ClawCommsClient:
         # Policy Gate — may raise PolicyBlockedError
         envelope = await self._policy.check(envelope)
 
-        # Determine NATS subject
-        nats_subject = subject or f"relay.{credential['workspace_id']}.{to if isinstance(to, str) else to[0]}"
+        # Determine NATS subject — publish to recipient's .inbox sub-subject
+        # so it matches the recipient's `relay.{ws}.{bot_id}.>` subscription
+        _to = to if isinstance(to, str) else to[0]
+        nats_subject = subject or f"relay.{credential['workspace_id']}.{_to}.inbox"
 
         if self._nc:
             await self._nc.publish(nats_subject, json.dumps(envelope).encode())

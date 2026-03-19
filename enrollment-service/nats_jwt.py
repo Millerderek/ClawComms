@@ -94,7 +94,10 @@ def create_user_jwt(
 ) -> str:
     """Issue a User JWT with per-bot subject permissions."""
     now = int(time.time())
-    # Subject ACLs — bot can only pub/sub to its own namespace + workspace broadcast
+    # Subject ACLs:
+    # Publish: any relay subject in this workspace (bot sends TO other bots)
+    # Subscribe: own inbox + workspace broadcast + reply inboxes
+    ws_relay     = f"relay.{workspace_id}.>"    # all workspace subjects (pub)
     bot_subject  = f"relay.{workspace_id}.{bot_id}.>"
     inbox_sub    = "_INBOX.>"
     broadcast    = f"relay.{workspace_id}.broadcast.>"
@@ -109,7 +112,7 @@ def create_user_jwt(
             "type": "user",
             "version": 2,
             "pub": {
-                "allow": [bot_subject],
+                "allow": [ws_relay, inbox_sub],  # can publish to any bot in workspace
             },
             "sub": {
                 "allow": [bot_subject, broadcast, inbox_sub],
