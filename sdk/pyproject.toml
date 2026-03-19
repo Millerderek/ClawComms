@@ -19,3 +19,6 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["clawcomms*"]
+
+[tool.setuptools.package-data]
+clawcomms = ["ca.crt"]

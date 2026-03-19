@@ -43,10 +43,12 @@ class ClawCommsClient:
         wrk_fingerprint: str,
         classification: str = "INTERNAL",
         use_default_policy_rules: bool = True,
+        nats_ca_cert: Optional[str] = None,
     ):
-        self.bot_id      = bot_id
-        self._nats_url   = nats_url
-        self._wrk_fp     = wrk_fingerprint
+        self.bot_id        = bot_id
+        self._nats_url     = nats_url
+        self._wrk_fp       = wrk_fingerprint
+        self._nats_ca_cert = nats_ca_cert
 
         # Core components
         self._identity   = IdentityManager()
@@ -236,6 +238,10 @@ class ClawCommsClient:
                     )
                     if creds_file:
                         connect_kwargs["user_credentials"] = creds_file
+                    if self._nats_ca_cert:
+                        import ssl
+                        tls_ctx = ssl.create_default_context(cafile=self._nats_ca_cert)
+                        connect_kwargs["tls"] = tls_ctx
 
                     self._nc = await nats.connect(self._nats_url, **connect_kwargs)
                     logger.info("NATS connected: %s", self._nats_url)
