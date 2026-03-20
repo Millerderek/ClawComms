@@ -38,7 +38,7 @@ services:
     container_name: clawcomms-enrollment
     restart: unless-stopped
     ports:
-      - "8001:8000"             # toolkit-nginx proxies via 172.17.0.1:8001
+      - "172.17.0.1:8001:8000"  # Docker bridge only — nginx + daemon, not exposed on public interface
     environment:
       - REDIS_URL=redis://redis:6379
       - IEK_CERT_PATH=/keys/iek/iek_cert.json
