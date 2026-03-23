@@ -234,18 +234,22 @@ class ClawCommsClient:
     # ── Internal ───────────────────────────────────────────────────────────
 
     async def _connect_nats(self, max_retries: int = 5):
-        import tempfile, os
+        import tempfile, os, stat
 
-        # Write .creds to a temp file if we have NATS credentials
+        # Write .creds to a secure temp file if we have NATS credentials.
+        # Use mkstemp for restrictive permissions (owner-only) and ensure
+        # cleanup in the finally block even if the process crashes mid-connect.
         creds_file = None
+        creds_fd = None
         nats_creds = self._enrollment.nats_creds
         if nats_creds:
-            tmp = tempfile.NamedTemporaryFile(
-                mode='w', suffix='.creds', delete=False
-            )
-            tmp.write(nats_creds)
-            tmp.close()
-            creds_file = tmp.name
+            creds_fd, creds_file = tempfile.mkstemp(suffix='.creds')
+            try:
+                os.fchmod(creds_fd, stat.S_IRUSR | stat.S_IWUSR)  # 0o600
+                os.write(creds_fd, nats_creds.encode())
+            finally:
+                os.close(creds_fd)
+                creds_fd = None
             logger.info("NATS: using issued credentials (JWT+NKey)")
         else:
             logger.info("NATS: connecting without auth (no NATS creds issued)")
@@ -279,7 +283,16 @@ class ClawCommsClient:
             raise ClawCommsError(f"Could not connect to NATS at {self._nats_url}")
         finally:
             if creds_file and os.path.exists(creds_file):
-                os.unlink(creds_file)   # Zeroize temp creds file
+                try:
+                    # Overwrite credential content with zeros before deletion
+                    file_size = os.path.getsize(creds_file)
+                    with open(creds_file, 'wb') as f:
+                        f.write(b'\x00' * file_size)
+                        f.flush()
+                        os.fsync(f.fileno())
+                except OSError:
+                    pass
+                os.unlink(creds_file)
 
     async def _nats_error_cb(self, e):
         logger.error("NATS error: %s", e)

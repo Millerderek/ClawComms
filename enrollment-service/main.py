@@ -138,6 +138,23 @@ def _sign(private_key: Ed25519PrivateKey, payload: dict) -> str:
     return private_key.sign(canonical).hex()
 
 
+def _verify_iek_sig(credential: dict) -> bool:
+    """Verify a credential's IEK signature using the loaded IEK public key."""
+    if _iek_pub is None:
+        return False
+    sig_hex = credential.get("iek_signature")
+    if not sig_hex:
+        return False
+    # Build the payload without the signature field for canonical verification
+    payload = {k: v for k, v in credential.items() if k != "iek_signature"}
+    canonical = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
+    try:
+        _iek_pub.verify(bytes.fromhex(sig_hex), canonical)
+        return True
+    except InvalidSignature:
+        return False
+
+
 def _verify_wrk_sig(payload: dict, sig_hex: str) -> bool:
     wrk_pub_path = Path("/keys/wrk/wrk_public.json")
     if not wrk_pub_path.exists():
@@ -375,29 +392,65 @@ async def enroll(req: EnrollRequest, request: Request, redis=Depends(get_redis))
         raise HTTPException(401, "Grant WRK signature invalid.")
     grant["wrk_signature"] = sig_hex  # restore
 
-    # ── Single-use check (Redis SET NX) ───────────────────────────────────────
-    used_key = f"clawcomms:used_grant:{grant['grant_id']}"
-    first_use_data = json.dumps({"first_used_at": _now_iso(), "source_ip": source_ip})
-    was_set = await redis.set(used_key, first_use_data, nx=True, ex=GRANT_USED_TTL)
-    if not was_set:
-        # §6.4 Security Addendum v1.0 — grant presented twice, possible interception
-        existing = await redis.get(used_key)
-        first_used_at = None
-        if existing:
+    # ── Single-use check (atomic Lua script) ────────────────────────────────
+    if grant.get("single_use", True):
+        used_key = f"clawcomms:used_grant:{grant['grant_id']}"
+        first_use_data = json.dumps({"first_used_at": _now_iso(), "source_ip": source_ip})
+        # Atomic check-and-set via Lua script: returns nil if set (first use),
+        # or the existing value if already used — eliminates race window between
+        # checking and setting that exists with separate GET + SET NX calls.
+        _GRANT_CAS_SCRIPT = """
+        local existing = redis.call('GET', KEYS[1])
+        if existing then
+            return existing
+        end
+        redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+        return nil
+        """
+        existing = await redis.eval(
+            _GRANT_CAS_SCRIPT, 1, used_key, first_use_data, str(GRANT_USED_TTL)
+        )
+        if existing is not None:
+            # §6.4 Security Addendum v1.0 — grant presented twice, possible interception
+            first_used_at = None
             try:
                 first_used_at = json.loads(existing).get("first_used_at")
             except Exception:
                 pass
-        logger.warning(
-            "SECURITY: grant presented twice grant_id=%s first_used_at=%s "
-            "second_attempt_at=%s source_ip=%s — possible grant interception",
-            grant["grant_id"], first_used_at, _now_iso(), source_ip
-        )
-        raise HTTPException(409, "Enrollment Grant already used.")
+            logger.warning(
+                "SECURITY: grant presented twice grant_id=%s first_used_at=%s "
+                "second_attempt_at=%s source_ip=%s — possible grant interception",
+                grant["grant_id"], first_used_at, _now_iso(), source_ip
+            )
+            raise HTTPException(409, "Enrollment Grant already used.")
 
     # ── Check role is allowed ─────────────────────────────────────────────────
     if grant["role"] not in _genesis["allowed_roles"]:
         raise HTTPException(400, f"Role '{grant['role']}' not allowed in this workspace.")
+
+    # ── Check classification against workspace ceiling ────────────────────────
+    _CLASS_ORDER = {"PUBLIC": 0, "INTERNAL": 1, "CONFIDENTIAL": 2, "SECRET": 3}
+    grant_class = grant.get("classification", "INTERNAL")
+    ceiling = _genesis.get("classification_ceiling", "INTERNAL")
+    if _CLASS_ORDER.get(grant_class, 0) > _CLASS_ORDER.get(ceiling, 1):
+        logger.warning(
+            "SECURITY: grant classification %s exceeds workspace ceiling %s grant_id=%s",
+            grant_class, ceiling, grant.get("grant_id", "unknown")
+        )
+        raise HTTPException(400, f"Classification '{grant_class}' exceeds workspace ceiling '{ceiling}'.")
+
+    # ── Validate bot public key ──────────────────────────────────────────────
+    try:
+        _bot_pub_raw = bytes.fromhex(grant["bot_public_key_hex"])
+        if len(_bot_pub_raw) != 32:
+            raise ValueError("Ed25519 public key must be exactly 32 bytes")
+        Ed25519PublicKey.from_public_bytes(_bot_pub_raw)
+    except (ValueError, Exception) as e:
+        logger.warning(
+            "SECURITY: invalid bot public key grant_id=%s error=%s source_ip=%s",
+            grant.get("grant_id", "unknown"), e, source_ip
+        )
+        raise HTTPException(400, "Invalid bot public key in grant.")
 
     # ── Check bot not revoked ─────────────────────────────────────────────────
     if await _is_bot_revoked(redis, grant["bot_id"], workspace_id):
@@ -469,6 +522,10 @@ async def refresh(req: RefreshRequest, redis=Depends(get_redis)):
     missing = required - old_bc.keys()
     if missing:
         raise HTTPException(400, f"Credential missing fields: {missing}")
+
+    # ── Verify IEK signature on old credential ──────────────────────────────
+    if not _verify_iek_sig(old_bc):
+        raise HTTPException(401, "Invalid credential signature.")
 
     if old_bc.get("workspace_id") != workspace_id:
         raise HTTPException(400, "Credential workspace_id mismatch.")
